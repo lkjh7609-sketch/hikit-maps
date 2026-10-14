@@ -94,12 +94,35 @@ style.sources.basemap = { type: "vector", tiles: ["hikit://basemap/{z}/{x}/{y}"]
 style.sources.terrain = { type: "raster-dem", tiles: ["hikit://terrain/{z}/{x}/{y}"], encoding: "terrarium", tileSize: 256, minzoom: 8, maxzoom: 12 };
 style.sources.contours = { type: "vector", tiles: ["hikit://contours/{z}/{x}/{y}"], minzoom: 12, maxzoom: 15 };
 
+// The style's glyph server has no Hangul (the iPhone draws Korean with a system font instead),
+// so labels come from OpenFreeMap's Noto Sans build, which includes CJK. Cached per run.
+const FONT_ALIAS = { "Noto Sans Medium": "Noto Sans Bold" };
+const glyphCache = new Map();
+async function glyphs(url) {
+  const m = url.match(/\/fonts\/([^/]+)\/(\d+-\d+)\.pbf/);
+  if (!m) return null;
+  const stack = decodeURIComponent(m[1]).split(",")[0];
+  const key = `${stack}/${m[2]}`;
+  if (glyphCache.has(key)) return glyphCache.get(key);
+  let data = null;
+  for (const u of [`https://tiles.openfreemap.org/fonts/${encodeURIComponent(FONT_ALIAS[stack] || stack)}/${m[2]}.pbf`, url]) {
+    const r = await fetch(u).catch(() => null);
+    if (r && r.ok) { data = Buffer.from(await r.arrayBuffer()); break; }
+  }
+  glyphCache.set(key, data);
+  return data;
+}
+
 async function request(req, cb) {
   try {
     const m = req.url.match(/^hikit:\/\/(\w+)\/(\d+)\/(\d+)\/(\d+)/);
     if (m) {
       const t = await archives[m[1]].getZxy(+m[2], +m[3], +m[4]);
       return cb(null, t ? { data: Buffer.from(t.data) } : {});
+    }
+    if (req.url.includes("/fonts/")) {
+      const g = await glyphs(req.url);
+      return cb(null, g ? { data: g } : {});
     }
     const r = await fetch(req.url);
     if (!r.ok) return cb(null, {});

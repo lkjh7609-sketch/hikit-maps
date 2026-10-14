@@ -1,0 +1,67 @@
+name: Build watch tiles
+
+# Raster tiles (512 px JPEG, z13-z15, land only) for the Apple Watch, rendered from the topo
+# archives in R2 (v1/) with the app's own style. The watch downloads them from watch/v1/{z}/{x}/{y}.jpg.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "west,south,east,north"
+        default: "124.5,33.0,131.0,38.7"
+  schedule:
+    - cron: "0 18 3 * *"   # monthly, two days after the topo build
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    env:
+      BBOX: ${{ inputs.bbox || '124.5,33.0,131.0,38.7' }}
+      SHARDS: 12
+      MAPS: https://pub-c577cf69800e40f7b9bc55033b692f16.r2.dev/v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb libgles2 libegl1 libopengl0 libglx0 libuv1 libcurl4 libjpeg-turbo8 libpng16-16 libwebp7 libicu74
+          cd Tools/watch && npm install --no-audit --no-fund
+
+      - name: Download topo archives
+        run: |
+          mkdir -p maps
+          for n in basemap terrain contours; do curl -sSfL -o "maps/$n.pmtiles" "$MAPS/$n.pmtiles"; done
+          ls -lh maps
+
+      - name: Render shard ${{ matrix.shard }}
+        run: |
+          xvfb-run -a -s "-screen 0 1024x768x24" node Tools/watch/render_watch_tiles.mjs MapStyle/HikitTopoStyle.json \
+            maps/basemap.pmtiles maps/terrain.pmtiles maps/contours.pmtiles out \
+            --bbox "$BBOX" --shard "${{ matrix.shard }}/$SHARDS"
+          du -sh out
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ vars.R2_BUCKET || 'hikit-maps' }}
+        run: |
+          aws configure set default.s3.max_concurrent_requests 64
+          aws s3 cp out/ "s3://$BUCKET/watch/v1/" --recursive --exclude "tiles-*.txt" \
+            --content-type image/jpeg --cache-control "public, max-age=2592000" \
+            --endpoint-url "$ENDPOINT" --only-show-errors
+          echo "uploaded $(find out -name '*.jpg' | wc -l) tiles"

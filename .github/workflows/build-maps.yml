@@ -1,0 +1,59 @@
+name: Build topo maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "west,south,east,north"
+        default: "124.5,33.0,131.0,38.7"
+      basemap_maxzoom:
+        description: "Basemap max zoom (14 ≈ 360 MB for South Korea, 15 ≈ 690 MB)"
+        default: "14"
+  schedule:
+    - cron: "0 18 1 * *"   # monthly, 03:00 KST on the 1st
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      BBOX: ${{ inputs.bbox || '124.5,33.0,131.0,38.7' }}
+      BASEMAP_MAXZOOM: ${{ inputs.basemap_maxzoom || '14' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gdal-bin build-essential libsqlite3-dev zlib1g-dev
+          git clone -q --depth 1 --branch 2.79.0 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+          make -C /tmp/tippecanoe -j"$(nproc)" >/dev/null && sudo make -C /tmp/tippecanoe install >/dev/null
+          curl -sSL -o /tmp/pm.tgz https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz
+          tar -xzf /tmp/pm.tgz -C /tmp pmtiles && sudo mv /tmp/pmtiles /usr/local/bin/
+          python3 -m venv .venv
+          .venv/bin/pip install -q numpy tifffile imagecodecs contourpy mapbox-vector-tile pillow
+
+      - name: Build
+        run: Tools/build_map_ci.sh "$BBOX" out
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ vars.R2_BUCKET || 'hikit-maps' }}
+        run: |
+          # New files go to a dated folder first, then replace v1/ so the app never sees a half-uploaded set.
+          STAMP=$(date -u +%Y%m%d)
+          aws s3 cp out/ "s3://$BUCKET/builds/$STAMP/" --recursive --endpoint-url "$ENDPOINT"
+          aws s3 sync "s3://$BUCKET/builds/$STAMP/" "s3://$BUCKET/v1/" --delete --endpoint-url "$ENDPOINT"
+          aws s3 rm "s3://$BUCKET/builds/$STAMP/" --recursive --endpoint-url "$ENDPOINT"   # keep storage under the free 10 GB
+          aws s3 ls "s3://$BUCKET/v1/" --endpoint-url "$ENDPOINT"

@@ -1,0 +1,44 @@
+name: Build trail network
+
+# OpenStreetMap trails, junctions and trail POIs as gzip JSON per z12 tile, for guidance on every
+# mountain. The apps read trails/v1/12/{x}/{y}.json. Data © OpenStreetMap contributors (ODbL).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 2 * *"   # monthly
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q osmium==4.0.2
+
+      - name: Download OSM extract
+        run: curl -sSfL -o korea.osm.pbf https://download.geofabrik.de/asia/south-korea-latest.osm.pbf && ls -lh korea.osm.pbf
+
+      - name: Build
+        run: .venv/bin/python Tools/build_osm_trails.py korea.osm.pbf out
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ vars.R2_BUCKET || 'hikit-maps' }}
+        run: |
+          aws configure set default.s3.max_concurrent_requests 32
+          aws s3 cp out/ "s3://$BUCKET/trails/v1/" --recursive \
+            --content-type application/json --content-encoding gzip \
+            --cache-control "public, max-age=604800" \
+            --endpoint-url "$ENDPOINT" --only-show-errors
+          echo "uploaded $(find out -name '*.json' | wc -l) tiles"
